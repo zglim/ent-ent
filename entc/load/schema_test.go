@@ -524,3 +524,136 @@ func TestMarshalMixin(t *testing.T) {
 		require.False(t, schema.Policy[1].MixedIn)
 	})
 }
+
+type panicFields struct{ ent.Schema }
+
+func (panicFields) Fields() []ent.Field { panic("Fields boom") }
+
+type panicEdges struct{ ent.Schema }
+
+func (panicEdges) Edges() []ent.Edge { panic("Edges boom") }
+
+type panicIndexes struct{ ent.Schema }
+
+func (panicIndexes) Indexes() []ent.Index { panic("Indexes boom") }
+
+type panicHooks struct{ ent.Schema }
+
+func (panicHooks) Hooks() []ent.Hook { panic("Hooks boom") }
+
+type panicInterceptors struct{ ent.Schema }
+
+func (panicInterceptors) Interceptors() []ent.Interceptor { panic("Interceptors boom") }
+
+type panicPolicy struct{ ent.Schema }
+
+func (panicPolicy) Policy() ent.Policy { panic("Policy boom") }
+
+type panicMixinSchema struct{ ent.Schema }
+
+func (panicMixinSchema) Mixin() []ent.Mixin { panic("Mixin boom") }
+
+// TestMarshalPanics ensures that a panic raised by any of the schema object
+// accessors is converted into an error through the shared safe* wrappers,
+// instead of crashing the marshaling.
+func TestMarshalPanics(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		schema ent.Interface
+	}{
+		{"Fields", panicFields{}},
+		{"Edges", panicEdges{}},
+		{"Indexes", panicIndexes{}},
+		{"Hooks", panicHooks{}},
+		{"Interceptors", panicInterceptors{}},
+		{"Policy", panicPolicy{}},
+		{"Mixin", panicMixinSchema{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			buf, err := MarshalSchema(tt.schema)
+			require.Nil(t, buf)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "panics")
+		})
+	}
+}
+
+type InterceptorsMixin struct {
+	mixin.Schema
+}
+
+func (InterceptorsMixin) Interceptors() []ent.Interceptor {
+	return []ent.Interceptor{
+		ent.InterceptFunc(func(ent.Querier) ent.Querier { return nil }),
+		ent.InterceptFunc(func(ent.Querier) ent.Querier { return nil }),
+	}
+}
+
+type WithInterceptors struct {
+	ent.Schema
+}
+
+func (WithInterceptors) Mixin() []ent.Mixin {
+	return []ent.Mixin{
+		InterceptorsMixin{},
+	}
+}
+
+func (WithInterceptors) Interceptors() []ent.Interceptor {
+	return []ent.Interceptor{
+		ent.InterceptFunc(func(ent.Querier) ent.Querier { return nil }),
+	}
+}
+
+// TestMarshalMixinInterceptors verifies that interceptor positions are recorded
+// consistently for both mixed-in and schema-level interceptors.
+func TestMarshalMixinInterceptors(t *testing.T) {
+	buf, err := MarshalSchema(WithInterceptors{})
+	require.NoError(t, err)
+
+	schema, err := UnmarshalSchema(buf)
+	require.NoError(t, err)
+
+	require.Len(t, schema.Interceptors, 3)
+	require.True(t, schema.Interceptors[0].MixedIn)
+	require.Equal(t, 0, schema.Interceptors[0].MixinIndex)
+	require.Equal(t, 0, schema.Interceptors[0].Index)
+	require.True(t, schema.Interceptors[1].MixedIn)
+	require.Equal(t, 0, schema.Interceptors[1].MixinIndex)
+	require.Equal(t, 1, schema.Interceptors[1].Index)
+	require.False(t, schema.Interceptors[2].MixedIn)
+	require.Equal(t, 0, schema.Interceptors[2].Index)
+}
+
+type NumericDefaults struct {
+	ent.Schema
+}
+
+func (NumericDefaults) Fields() []ent.Field {
+	return []ent.Field{
+		field.Int("int_val").
+			Default(7),
+		field.Uint("uint_val").
+			Default(9),
+		field.Int64("big_val").
+			Default(int64(1) << 40),
+	}
+}
+
+// TestUnmarshalDefaults verifies that numeric default values are restored to
+// their original integer kinds after a JSON round-trip via UnmarshalSchema.
+func TestUnmarshalDefaults(t *testing.T) {
+	buf, err := MarshalSchema(NumericDefaults{})
+	require.NoError(t, err)
+
+	schema, err := UnmarshalSchema(buf)
+	require.NoError(t, err)
+
+	require.Len(t, schema.Fields, 3)
+	require.True(t, schema.Fields[0].Default)
+	require.Equal(t, int64(7), schema.Fields[0].DefaultValue)
+	require.True(t, schema.Fields[1].Default)
+	require.Equal(t, uint64(9), schema.Fields[1].DefaultValue)
+	require.True(t, schema.Fields[2].Default)
+	require.Equal(t, int64(1)<<40, schema.Fields[2].DefaultValue)
+}
