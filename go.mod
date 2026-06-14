@@ -1,11 +1,9 @@
 module entgo.io/ent
 
-go 1.24
-
-toolchain go1.24.0
+go 1.25.0
 
 require (
-	ariga.io/atlas v0.36.2-0.20250730182955-2c6300d0a3e1
+	ariga.io/atlas v1.2.2
 	github.com/DATA-DOG/go-sqlmock v1.5.0
 	github.com/go-openapi/inflect v0.19.0
 	github.com/google/uuid v1.3.0
@@ -17,10 +15,11 @@ require (
 	github.com/modern-go/reflect2 v1.0.2
 	github.com/olekukonko/tablewriter v1.1.3
 	github.com/spf13/cobra v1.7.0
-	github.com/stretchr/testify v1.8.4
+	github.com/stretchr/testify v1.11.1
 	go.opencensus.io v0.24.0
-	golang.org/x/sync v0.11.0
-	golang.org/x/tools v0.30.0
+	golang.org/x/sync v0.20.0
+	golang.org/x/tools v0.44.0
+	golang.org/x/tools/go/packages/packagestest v0.1.1-deprecated
 )
 
 require (
@@ -33,7 +32,7 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
-	github.com/google/go-cmp v0.6.0 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/hashicorp/hcl/v2 v2.18.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/kr/pretty v0.3.0 // indirect
@@ -42,19 +41,18 @@ require (
 	github.com/mattn/go-runewidth v0.0.19 // indirect
 	github.com/mitchellh/go-wordwrap v1.0.1 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
-	github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e // indirect
 	github.com/olekukonko/cat v0.0.0-20250911104152-50322a0618f6 // indirect
 	github.com/olekukonko/errors v1.1.0 // indirect
 	github.com/olekukonko/ll v0.1.4-0.20260115111900-9e59c2286df0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/sergi/go-diff v1.3.1 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
-	github.com/stretchr/objx v0.5.0 // indirect
+	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/zclconf/go-cty v1.14.4 // indirect
 	github.com/zclconf/go-cty-yaml v1.1.0 // indirect
-	golang.org/x/mod v0.24.0 // indirect
-	golang.org/x/sys v0.30.0 // indirect
-	golang.org/x/text v0.21.0 // indirect
-	gopkg.in/check.v1 v1.0.0-20200227125254-8fa46927fb4f // indirect
+	golang.org/x/mod v0.35.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/tools/go/expect v0.1.0-deprecated // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
