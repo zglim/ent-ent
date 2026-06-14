@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"strconv"
 	"strings"
 
 	"entgo.io/ent/dialect"
@@ -158,13 +157,7 @@ func (d *Postgres) atTypeC(c1 *Column, c2 *schema.Column) error {
 func (d *Postgres) atUniqueC(t1 *Table, c1 *Column, t2 *schema.Table, c2 *schema.Column) {
 	// For UNIQUE columns, PostgreSQL creates an implicit index named
 	// "<table>_<column>_key<i>".
-	for _, idx := range t1.Indexes {
-		// Index also defined explicitly, and will be added in atIndexes.
-		if idx.Unique && d.atImplicitIndexName(idx, t1, c1) {
-			return
-		}
-	}
-	t2.AddIndexes(schema.NewUniqueIndex(fmt.Sprintf("%s_%s_key", t1.Name, c1.Name)).AddColumns(c2))
+	atUniqueColumn(t1, c1, t2, c2, fmt.Sprintf("%s_%s_key", t1.Name, c1.Name), d.atImplicitIndexName)
 }
 
 func (d *Postgres) atImplicitIndexName(idx *Index, t1 *Table, c1 *Column) bool {
@@ -172,8 +165,7 @@ func (d *Postgres) atImplicitIndexName(idx *Index, t1 *Table, c1 *Column) bool {
 	if idx.Name == p {
 		return true
 	}
-	i, err := strconv.ParseInt(strings.TrimPrefix(idx.Name, p), 10, 64)
-	return err == nil && i > 0
+	return atImplicitIndexSuffix(idx.Name, p, 1)
 }
 
 func (d *Postgres) atIncrementC(t *schema.Table, c *schema.Column) {
@@ -215,20 +207,17 @@ func indexOpClass(idx *Index) map[string]string {
 
 func (d *Postgres) atIndex(idx1 *Index, t2 *schema.Table, idx2 *schema.Index) error {
 	opc := indexOpClass(idx1)
-	for _, c1 := range idx1.Columns {
-		c2, ok := t2.Column(c1.Name)
-		if !ok {
-			return fmt.Errorf("unexpected index %q column: %q", idx1.Name, c1.Name)
-		}
-		part := &schema.IndexPart{C: c2}
+	if err := atIndexParts(idx1, t2, idx2, func(c1 *Column, _ *schema.Column) ([]schema.Attr, error) {
 		if v, ok := opc[c1.Name]; ok {
 			var op postgres.IndexOpClass
 			if err := op.UnmarshalText([]byte(v)); err != nil {
-				return fmt.Errorf("unmarshalling operator-class %q for column %q: %v", v, c1.Name, err)
+				return nil, fmt.Errorf("unmarshalling operator-class %q for column %q: %v", v, c1.Name, err)
 			}
-			part.Attrs = append(part.Attrs, &op)
+			return []schema.Attr{&op}, nil
 		}
-		idx2.AddParts(part)
+		return nil, nil
+	}); err != nil {
+		return err
 	}
 	if t, ok := indexType(idx1, dialect.Postgres); ok {
 		idx2.AddAttrs(&postgres.IndexType{T: t})
