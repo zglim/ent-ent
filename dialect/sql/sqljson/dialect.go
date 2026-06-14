@@ -12,55 +12,114 @@ import (
 	"entgo.io/ent/dialect/sql"
 )
 
-type sqlite struct{}
+// arrayAppender abstracts the SQL differences between the MySQL and SQLite
+// implementations of appending elements to a JSON array. The shared
+// CASE-WHEN flow lives in appendToArray, so each dialect only needs to
+// describe its own SQL specifics.
+type arrayAppender interface {
+	// jsonType writes the expression returning the JSON type of the value
+	// at the column's path. It is used to detect a NULL or JSON "null".
+	jsonType(b *sql.Builder, column string, opts []Option)
+	// jsonNull is the textual JSON null literal that jsonType returns
+	// (already quoted, e.g. 'null' or 'NULL').
+	jsonNull() string
+	// initArray writes a JSON array literal built from elems, used when the
+	// current value is NULL or JSON "null". When nested is true the literal
+	// is embedded as a JSON_SET value and must be a JSON expression;
+	// otherwise it is assigned directly to the column.
+	initArray(b *sql.Builder, elems []any, nested bool)
+	// appendArray writes the call that appends elems into the existing
+	// (non-null) JSON array located at the column's path.
+	appendArray(b *sql.Builder, column string, elems []any, opts []Option)
+}
 
-// Append implements the driver.Append method.
-func (d *sqlite) Append(u *sql.UpdateBuilder, column string, elems []any, opts ...Option) {
+// appendToArray builds the CASE-WHEN statement shared by MySQL and SQLite for
+// appending elems to a JSON array, optionally located at the given path. The
+// dialect-specific SQL is delegated to the given arrayAppender.
+//
+// Following the Go semantics, the column/key is initialized with the given
+// array in case its current value is NULL or a JSON "null"; otherwise the
+// elements are appended to the existing array.
+func appendToArray(u *sql.UpdateBuilder, column string, elems []any, opts []Option, d arrayAppender) {
 	setCase(u, column, when{
 		Cond: func(b *sql.Builder) {
-			typ := func(b *sql.Builder) *sql.Builder {
-				return b.WriteString("JSON_TYPE").Wrap(func(b *sql.Builder) {
-					b.Ident(column).Comma()
-					identPath(column, opts...).mysqlPath(b)
-				})
-			}
-			typ(b).WriteOp(sql.OpIsNull)
+			d.jsonType(b, column, opts)
+			b.WriteOp(sql.OpIsNull)
 			b.WriteString(" OR ")
-			typ(b).WriteOp(sql.OpEQ).WriteString("'null'")
+			d.jsonType(b, column, opts)
+			b.WriteOp(sql.OpEQ).WriteString(d.jsonNull())
 		},
 		Then: func(b *sql.Builder) {
+			// If a path was provided, set the value at this path; otherwise,
+			// the top-level value is the JSON array itself.
 			if len(opts) > 0 {
 				b.WriteString("JSON_SET").Wrap(func(b *sql.Builder) {
 					b.Ident(column).Comma()
 					identPath(column, opts...).mysqlPath(b)
-					b.Comma().Argf("JSON(?)", marshalArg(elems))
+					b.Comma()
+					d.initArray(b, elems, true)
 				})
 			} else {
-				b.Arg(marshalArg(elems))
+				d.initArray(b, elems, false)
 			}
 		},
 		Else: func(b *sql.Builder) {
-			b.WriteString("JSON_INSERT").Wrap(func(b *sql.Builder) {
-				b.Ident(column).Comma()
-				// If no path was provided the top-level value is
-				// a JSON array. i.e. JSON_INSERT(c, '$[#]', ?).
-				path := func(b *sql.Builder) { b.WriteString("'$[#]'") }
-				if len(opts) > 0 {
-					p := identPath(column, opts...)
-					p.Path = append(p.Path, "[#]")
-					path = p.mysqlPath
-				}
-				for i, e := range elems {
-					if i > 0 {
-						b.Comma()
-					}
-					path(b)
-					b.Comma()
-					d.appendArg(b, e)
-				}
-			})
+			d.appendArray(b, column, elems, opts)
 		},
 	})
+}
+
+// appendElems writes the call "fn(column, path, arg, path, arg, ...)" used by
+// the MySQL/SQLite array-append functions, delegating the per-element path and
+// argument formatting to the given writers.
+func appendElems(b *sql.Builder, fn, column string, elems []any, path func(*sql.Builder), arg func(*sql.Builder, any)) {
+	b.WriteString(fn).Wrap(func(b *sql.Builder) {
+		b.Ident(column).Comma()
+		for i, e := range elems {
+			if i > 0 {
+				b.Comma()
+			}
+			path(b)
+			b.Comma()
+			arg(b, e)
+		}
+	})
+}
+
+// appendIndexPath returns a writer for the array-append path used by SQLite's
+// JSON_INSERT, i.e. the column path suffixed with the append index "[#]"
+// ('$[#]' for the top-level array or '$.a[#]' for a nested one).
+func appendIndexPath(column string, opts ...Option) func(*sql.Builder) {
+	p := identPath(column, opts...)
+	p.Path = append(p.Path, "[#]")
+	return p.mysqlPath
+}
+
+type sqlite struct{}
+
+// Append implements the driver.Append method.
+func (d *sqlite) Append(u *sql.UpdateBuilder, column string, elems []any, opts ...Option) {
+	appendToArray(u, column, elems, opts, d)
+}
+
+func (*sqlite) jsonType(b *sql.Builder, column string, opts []Option) {
+	identPath(column, opts...).mysqlFunc("JSON_TYPE", b)
+}
+
+func (*sqlite) jsonNull() string { return "'null'" }
+
+func (*sqlite) initArray(b *sql.Builder, elems []any, nested bool) {
+	// As a JSON_SET value the document must be parsed back into JSON,
+	// while at the top level it is assigned to the column as-is.
+	if nested {
+		b.Argf("JSON(?)", marshalArg(elems))
+	} else {
+		b.Arg(marshalArg(elems))
+	}
+}
+
+func (d *sqlite) appendArray(b *sql.Builder, column string, elems []any, opts []Option) {
+	appendElems(b, "JSON_INSERT", column, elems, appendIndexPath(column, opts...), d.appendArg)
 }
 
 func (d *sqlite) appendArg(b *sql.Builder, v any) {
@@ -76,43 +135,23 @@ type mysql struct{}
 
 // Append implements the driver.Append method.
 func (d *mysql) Append(u *sql.UpdateBuilder, column string, elems []any, opts ...Option) {
-	setCase(u, column, when{
-		Cond: func(b *sql.Builder) {
-			typ := func(b *sql.Builder) *sql.Builder {
-				b.WriteString("JSON_TYPE(JSON_EXTRACT(")
-				b.Ident(column).Comma()
-				identPath(column, opts...).mysqlPath(b)
-				return b.WriteString("))")
-			}
-			typ(b).WriteOp(sql.OpIsNull)
-			b.WriteString(" OR ")
-			typ(b).WriteOp(sql.OpEQ).WriteString("'NULL'")
-		},
-		Then: func(b *sql.Builder) {
-			if len(opts) > 0 {
-				b.WriteString("JSON_SET").Wrap(func(b *sql.Builder) {
-					b.Ident(column).Comma()
-					identPath(column, opts...).mysqlPath(b)
-					b.Comma().WriteString("JSON_ARRAY(").Args(d.marshalArgs(elems)...).WriteByte(')')
-				})
-			} else {
-				b.WriteString("JSON_ARRAY(").Args(d.marshalArgs(elems)...).WriteByte(')')
-			}
-		},
-		Else: func(b *sql.Builder) {
-			b.WriteString("JSON_ARRAY_APPEND").Wrap(func(b *sql.Builder) {
-				b.Ident(column).Comma()
-				for i, e := range elems {
-					if i > 0 {
-						b.Comma()
-					}
-					identPath(column, opts...).mysqlPath(b)
-					b.Comma()
-					d.appendArg(b, e)
-				}
-			})
-		},
-	})
+	appendToArray(u, column, elems, opts, d)
+}
+
+func (*mysql) jsonType(b *sql.Builder, column string, opts []Option) {
+	b.WriteString("JSON_TYPE(")
+	identPath(column, opts...).mysqlFunc("JSON_EXTRACT", b)
+	b.WriteByte(')')
+}
+
+func (*mysql) jsonNull() string { return "'NULL'" }
+
+func (d *mysql) initArray(b *sql.Builder, elems []any, _ bool) {
+	b.WriteString("JSON_ARRAY(").Args(d.marshalArgs(elems)...).WriteByte(')')
+}
+
+func (d *mysql) appendArray(b *sql.Builder, column string, elems []any, opts []Option) {
+	appendElems(b, "JSON_ARRAY_APPEND", column, elems, identPath(column, opts...).mysqlPath, d.appendArg)
 }
 
 func (d *mysql) marshalArgs(args []any) []any {
@@ -141,19 +180,18 @@ type postgres struct{}
 func (*postgres) Append(u *sql.UpdateBuilder, column string, elems []any, opts ...Option) {
 	setCase(u, column, when{
 		Cond: func(b *sql.Builder) {
-			valuePath(b, column, append(opts, Cast("jsonb"))...)
+			// Compare the jsonb value at the path against NULL and JSON "null".
+			value := identPath(column, append(opts, Cast("jsonb"))...)
+			value.value(b)
 			b.WriteOp(sql.OpIsNull)
 			b.WriteString(" OR ")
-			valuePath(b, column, append(opts, Cast("jsonb"))...)
+			value.value(b)
 			b.WriteOp(sql.OpEQ).WriteString("'null'::jsonb")
 		},
 		Then: func(b *sql.Builder) {
 			if len(opts) > 0 {
-				b.WriteString("jsonb_set").Wrap(func(b *sql.Builder) {
-					b.Ident(column).Comma()
-					identPath(column, opts...).pgArrayPath(b)
-					b.Comma().Arg(marshalArg(elems))
-					b.Comma().WriteString("true")
+				pgJSONBSet(b, column, opts, func(b *sql.Builder) {
+					b.Arg(marshalArg(elems))
 				})
 			} else {
 				b.Arg(marshalArg(elems))
@@ -161,19 +199,26 @@ func (*postgres) Append(u *sql.UpdateBuilder, column string, elems []any, opts .
 		},
 		Else: func(b *sql.Builder) {
 			if len(opts) > 0 {
-				b.WriteString("jsonb_set").Wrap(func(b *sql.Builder) {
-					b.Ident(column).Comma()
-					identPath(column, opts...).pgArrayPath(b)
-					b.Comma()
-					path := identPath(column, opts...)
-					path.value(b)
+				pgJSONBSet(b, column, opts, func(b *sql.Builder) {
+					identPath(column, opts...).value(b)
 					b.WriteString(" || ").Arg(marshalArg(elems))
-					b.Comma().WriteString("true")
 				})
 			} else {
 				b.Ident(column).WriteString(" || ").Arg(marshalArg(elems))
 			}
 		},
+	})
+}
+
+// pgJSONBSet writes "jsonb_set(column, '{path}', value, true)", delegating the
+// value expression (the new array or the concatenation) to the given writer.
+func pgJSONBSet(b *sql.Builder, column string, opts []Option, value func(*sql.Builder)) {
+	b.WriteString("jsonb_set").Wrap(func(b *sql.Builder) {
+		b.Ident(column).Comma()
+		identPath(column, opts...).pgArrayPath(b)
+		b.Comma()
+		value(b)
+		b.Comma().WriteString("true")
 	})
 }
 

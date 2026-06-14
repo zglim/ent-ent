@@ -524,6 +524,70 @@ func TestAppend(t *testing.T) {
 			wantQuery: "UPDATE `t` SET `c` = CASE WHEN (JSON_TYPE(JSON_EXTRACT(`c`, '$.a')) IS NULL OR JSON_TYPE(JSON_EXTRACT(`c`, '$.a')) = 'NULL') THEN JSON_SET(`c`, '$.a', JSON_ARRAY(?)) ELSE JSON_ARRAY_APPEND(`c`, '$.a', ?) END",
 			wantArgs:  []any{"a", "a"},
 		},
+		// SQLite: appending multiple primitives to the top-level array
+		// exercises the shared per-element loop of JSON_INSERT.
+		{
+			input: func() sql.Querier {
+				u := sql.Dialect(dialect.SQLite).Update("t")
+				sqljson.Append(u, "c", []int{1, 2})
+				return u
+			}(),
+			wantQuery: "UPDATE `t` SET `c` = CASE WHEN (JSON_TYPE(`c`, '$') IS NULL OR JSON_TYPE(`c`, '$') = 'null') THEN ? ELSE JSON_INSERT(`c`, '$[#]', ?, '$[#]', ?) END",
+			wantArgs:  []any{"[1,2]", 1, 2},
+		},
+		// SQLite: appending to a nested array path exercises the "[#]"
+		// index-path generation on top of a non-trivial path.
+		{
+			input: func() sql.Querier {
+				u := sql.Dialect(dialect.SQLite).Update("t")
+				sqljson.Append(u, "c", []string{"x"}, sqljson.Path("a", "[1]", "b"))
+				return u
+			}(),
+			wantQuery: "UPDATE `t` SET `c` = CASE WHEN (JSON_TYPE(`c`, '$.a[1].b') IS NULL OR JSON_TYPE(`c`, '$.a[1].b') = 'null') THEN JSON_SET(`c`, '$.a[1].b', JSON(?)) ELSE JSON_INSERT(`c`, '$.a[1].b[#]', ?) END",
+			wantArgs:  []any{`["x"]`, "x"},
+		},
+		// MySQL: appending a non-primitive value exercises the JSON
+		// serialization helpers (JSON_ARRAY init and CAST(? AS JSON)).
+		{
+			input: func() sql.Querier {
+				u := sql.Dialect(dialect.MySQL).Update("t")
+				sqljson.Append(u, "c", []any{map[string]int{"k": 1}})
+				return u
+			}(),
+			wantQuery: "UPDATE `t` SET `c` = CASE WHEN (JSON_TYPE(JSON_EXTRACT(`c`, '$')) IS NULL OR JSON_TYPE(JSON_EXTRACT(`c`, '$')) = 'NULL') THEN JSON_ARRAY(?) ELSE JSON_ARRAY_APPEND(`c`, '$', CAST(? AS JSON)) END",
+			wantArgs:  []any{`{"k":1}`, `{"k":1}`},
+		},
+		// MySQL: appending multiple primitives to a path exercises the
+		// shared per-element loop of JSON_ARRAY_APPEND.
+		{
+			input: func() sql.Querier {
+				u := sql.Dialect(dialect.MySQL).Update("t")
+				sqljson.Append(u, "c", []int{1, 2}, sqljson.Path("a"))
+				return u
+			}(),
+			wantQuery: "UPDATE `t` SET `c` = CASE WHEN (JSON_TYPE(JSON_EXTRACT(`c`, '$.a')) IS NULL OR JSON_TYPE(JSON_EXTRACT(`c`, '$.a')) = 'NULL') THEN JSON_SET(`c`, '$.a', JSON_ARRAY(?, ?)) ELSE JSON_ARRAY_APPEND(`c`, '$.a', ?, '$.a', ?) END",
+			wantArgs:  []any{1, 2, 1, 2},
+		},
+		// Postgres (no path): regression guard for the "||" concatenation.
+		{
+			input: func() sql.Querier {
+				u := sql.Dialect(dialect.Postgres).Update("t")
+				sqljson.Append(u, "c", []int{1, 2})
+				return u
+			}(),
+			wantQuery: `UPDATE "t" SET "c" = CASE WHEN ("c" IS NULL OR "c" = 'null'::jsonb) THEN $1 ELSE "c" || $2 END`,
+			wantArgs:  []any{"[1,2]", "[1,2]"},
+		},
+		// Postgres (with path): regression guard for jsonb_set + "||".
+		{
+			input: func() sql.Querier {
+				u := sql.Dialect(dialect.Postgres).Update("t")
+				sqljson.Append(u, "c", []int{1, 2}, sqljson.Path("a", "b"))
+				return u
+			}(),
+			wantQuery: `UPDATE "t" SET "c" = CASE WHEN (("c"->'a'->'b')::jsonb IS NULL OR ("c"->'a'->'b')::jsonb = 'null'::jsonb) THEN jsonb_set("c", '{a, b}', $1, true) ELSE jsonb_set("c", '{a, b}', "c"->'a'->'b' || $2, true) END`,
+			wantArgs:  []any{"[1,2]", "[1,2]"},
+		},
 	}
 	for i, tt := range tests {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
