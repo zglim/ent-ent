@@ -187,3 +187,144 @@ func TestDirWriter(t *testing.T) {
 		})
 	}
 }
+
+// TestMatchReturning guards that the hand-written matcher stays equivalent to
+// the reReturning regexp it replaces in the hot scanning loops.
+func TestMatchReturning(t *testing.T) {
+	for _, s := range []string{
+		"", "R", "RETURN", "RETURNING", "returning x", "ReTuRnInG id",
+		" RETURNING", "\tRETURNING", "\nRETURNING", "\fRETURNING", "\rRETURNING",
+		"  RETURNING", "xRETURNING", "RETURNINX", " returning",
+	} {
+		require.Equalf(t, reReturning.MatchString(s), matchReturning(s), "string %q", s)
+		require.Equalf(t, reReturning.Match([]byte(s)), matchReturning([]byte(s)), "bytes %q", s)
+	}
+}
+
+// TestReturningClause covers the shared scan that locates a RETURNING clause,
+// including quoted content that must not be mistaken for the keyword.
+func TestReturningClause(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		query  string
+		clause string // expected query[start:end]; "" means no clause located
+		found  bool
+		ok     bool
+	}{
+		{"none", `INSERT INTO "t" ("c") VALUES ('v')`, "", false, true},
+		{"keyword in string", `INSERT INTO "t" ("c") VALUES ('x RETURNING y')`, "", false, true},
+		{"keyword in identifier", "INSERT INTO `RETURNING` (`c`) VALUES ('v')", "", false, true},
+		{"simple", `INSERT INTO "t" ("c") VALUES ('v') RETURNING id`, ` RETURNING id`, true, true},
+		{"quoted cols", `INSERT INTO "t" ("c") VALUES ('v') RETURNING "id", "name"`, ` RETURNING "id", "name"`, true, true},
+		{"terminated", `INSERT INTO "t" ("c") VALUES ('v') RETURNING "id"; DROP "x"`, ` RETURNING "id"`, true, true},
+		{"no leading space", `INSERT INTO "t" ("c") VALUES ('v')RETURNING id`, `RETURNING id`, true, true},
+		{"malformed quote", `INSERT INTO "t ("c") VALUES ('v') RETURNING id`, "", false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			start, end, ok := returningClause(tt.query)
+			require.Equal(t, tt.ok, ok)
+			if !ok {
+				return
+			}
+			require.Equal(t, tt.found, start >= 0)
+			if start >= 0 {
+				require.Equal(t, tt.clause, tt.query[start:end])
+			}
+			// The []byte path used by trimReturning must agree with the string path.
+			bs, be, bok := returningClause([]byte(tt.query))
+			require.Equal(t, ok, bok)
+			require.Equal(t, start, bs)
+			require.Equal(t, end, be)
+		})
+	}
+}
+
+// TestReturningColumns covers the column-name extraction from a located clause.
+func TestReturningColumns(t *testing.T) {
+	require.Equal(t, []string{"id"}, returningColumns(` RETURNING id`))
+	require.Equal(t, []string{"id", `"name"`}, returningColumns(` RETURNING id, "name"`))
+	require.Equal(t, []string{`"id"`, `"name"`}, returningColumns(`RETURNING "id", "name"`))
+	require.Equal(t, []string{""}, returningColumns(""))
+}
+
+// TestTrimReturning covers dropping the RETURNING suffix while keeping quoted
+// content and any terminating statement intact.
+func TestTrimReturning(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			"postgres identifiers",
+			`INSERT INTO "users" ("name") VALUES ('a8m') RETURNING "id";`,
+			`INSERT INTO "users" ("name") VALUES ('a8m');`,
+		},
+		{
+			"no leading space",
+			"INSERT INTO `users` (`name`) VALUES ('a8m')RETURNING `id`;",
+			"INSERT INTO `users` (`name`) VALUES ('a8m');",
+		},
+		{
+			"keyword inside string is kept",
+			`INSERT INTO "t" ("c") VALUES ('x RETURNING y');`,
+			`INSERT INTO "t" ("c") VALUES ('x RETURNING y');`,
+		},
+		{
+			"no returning",
+			`INSERT INTO "t" ("c") VALUES ('v');`,
+			`INSERT INTO "t" ("c") VALUES ('v');`,
+		},
+		{
+			"malformed quote is untouched",
+			`INSERT INTO "t" ("c") VALUES ('unclosed RETURNING "id"`,
+			`INSERT INTO "t" ("c") VALUES ('unclosed RETURNING "id"`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, string(trimReturning([]byte(tt.in))))
+		})
+	}
+}
+
+// TestExpandArgs covers placeholder expansion across dialects together with the
+// quote-skipping convention that protects literal placeholders inside strings.
+func TestExpandArgs(t *testing.T) {
+	b := &bytes.Buffer{}
+	pg := NewWriteDriver(dialect.Postgres, b)
+	require.Equal(t,
+		`INSERT INTO "users" ("name", "age") VALUES ('a8m', 42)`,
+		pg.expandArgs(`INSERT INTO "users" ("name", "age") VALUES ($1, $2)`, []any{"a8m", 42}),
+	)
+	// A '$1' inside a string literal must not be expanded as a placeholder.
+	require.Equal(t,
+		`UPDATE "t" SET "a" = '$1', "b" = 7`,
+		pg.expandArgs(`UPDATE "t" SET "a" = '$1', "b" = $1`, []any{7}),
+	)
+
+	my := NewWriteDriver(dialect.MySQL, b)
+	require.Equal(t,
+		"UPDATE `t` SET `a` = 1, `b` = 'x'",
+		my.expandArgs("UPDATE `t` SET `a` = ?, `b` = ?", []any{1, "x"}),
+	)
+	// A '?' inside a string literal must not consume a positional argument.
+	require.Equal(t,
+		"UPDATE `t` SET `a` = '?', `b` = 5",
+		my.expandArgs("UPDATE `t` SET `a` = '?', `b` = ?", []any{5}),
+	)
+}
+
+// TestMockReturningColumns covers the columns mocked for sql.Rows from a
+// RETURNING clause, including malformed and missing clauses.
+func TestMockReturningColumns(t *testing.T) {
+	require.Equal(t, []string{"id"},
+		mockReturningColumns(`INSERT INTO "users" (name) VALUES('a8m') RETURNING id`))
+	require.Equal(t, []string{`"id"`, `"name"`},
+		mockReturningColumns(`INSERT INTO "users" (name) VALUES('a8m') RETURNING "id", "name"; DROP "x"`))
+	// No RETURNING clause yields a single empty column name (legacy behavior).
+	require.Equal(t, []string{""},
+		mockReturningColumns(`INSERT INTO "users" (name) VALUES('a8m')`))
+	// A malformed quote yields nil columns.
+	require.Nil(t,
+		mockReturningColumns(`INSERT INTO "users VALUES('a8m') RETURNING id`))
+}

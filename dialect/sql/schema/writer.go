@@ -110,47 +110,9 @@ func (w *WriteDriver) Query(ctx context.Context, query string, args, res any) er
 		if err := w.Exec(ctx, query, args, nil); err != nil {
 			return err
 		}
+		// If the query has a RETURNING clause, mock its columns in the result.
 		if rr, ok := res.(*sql.Rows); ok {
-			cols := func() []string {
-				// If the query has a RETURNING clause, mock the result.
-				var clause string
-			outer:
-				for i := 0; i < len(query); i++ {
-					switch q := query[i]; {
-					case q == '\'', q == '"', q == '`': // string or identifier
-						_, skip := skipQuoted(query, i)
-						if skip == -1 {
-							return nil // malformed SQL
-						}
-						i = skip
-						continue
-					case reReturning.MatchString(query[i:]):
-						var j int
-					inner:
-						// Forward until next unquoted ';' appears, or we reach the end of the query.
-						for j = i; j < len(query); j++ {
-							switch query[j] {
-							case '\'', '"', '`': // string or identifier
-								_, skip := skipQuoted(query, j)
-								if skip == -1 {
-									return nil // malformed RETURNING clause
-								}
-								j = skip
-							case ';':
-								break inner
-							}
-						}
-						clause = query[i:j]
-						break outer
-					}
-				}
-				cols := strings.Split(reReturning.ReplaceAllString(clause, ""), ",")
-				for i := range cols {
-					cols[i] = strings.TrimSpace(cols[i])
-				}
-				return cols
-			}()
-			*rr = sql.Rows{ColumnScanner: &noRows{cols: cols}}
+			*rr = sql.Rows{ColumnScanner: &noRows{cols: mockReturningColumns(query)}}
 		}
 		return nil
 	}
@@ -160,6 +122,22 @@ func (w *WriteDriver) Query(ctx context.Context, query string, args, res any) er
 	default:
 		return w.Driver.Query(ctx, query, args, res)
 	}
+}
+
+// mockReturningColumns reports the column names that the RETURNING clause of an
+// INSERT/UPDATE statement would yield, used to mock the columns of sql.Rows.
+// It returns nil when the query contains a malformed (unterminated) quote,
+// preserving the previous best-effort behavior.
+func mockReturningColumns(query string) []string {
+	start, end, ok := returningClause(query)
+	if !ok {
+		return nil
+	}
+	var clause string
+	if start >= 0 {
+		clause = query[start:end]
+	}
+	return returningColumns(clause)
 }
 
 // expandArgs combines to arguments and statement into a single statement to
@@ -172,7 +150,6 @@ func (w *WriteDriver) expandArgs(query string, args []any) string {
 		scan = w.scanPlaceholder()
 	)
 	for i := 0; i < len(query); i++ {
-	Top:
 		switch query[i] {
 		case p:
 			idx, size := scan(query[i+1:])
@@ -187,20 +164,14 @@ func (w *WriteDriver) expandArgs(query string, args []any) string {
 				return query
 			}
 			b.WriteString(v)
-		// String or identifier.
-		case '\'', '"', '`':
-			for j := i + 1; j < len(query); j++ {
-				switch query[j] {
-				case '\\':
-					j++
-				case query[i]:
-					b.WriteString(query[i : j+1])
-					i = j
-					break Top
-				}
+		case '\'', '"', '`': // string or identifier
+			frag, skip := skipQuoted(query, i)
+			if skip == -1 {
+				// Unexpected EOS.
+				return query
 			}
-			// Unexpected EOS.
-			return query
+			b.WriteString(frag)
+			i = skip
 		default:
 			b.WriteByte(query[i])
 		}
@@ -273,43 +244,46 @@ func (w *WriteDriver) formatArg(v any) (string, error) {
 
 var reReturning = regexp.MustCompile(`(?i)^\s?RETURNING`)
 
-// trimReturning trims any RETURNING suffix from INSERT/UPDATE queries.
-// Note, that the output may be incorrect or unsafe SQL and require manual changes.
-func trimReturning(query []byte) []byte {
-	var b bytes.Buffer
-loop:
-	for i := 0; i < len(query); i++ {
-		switch q := query[i]; {
-		case q == '\'', q == '"', q == '`': // string or identifier
-			s, skip := skipQuoted(query, i)
-			if skip == -1 {
-				return query
-			}
-			b.Write(s)
-			i = skip
-			continue
-		case reReturning.Match(query[i:]):
-			// Forward until next unquoted ';' appears.
-			for j := i; j < len(query); j++ { // skip "RETURNING"
-				switch query[j] {
-				case '\'', '"', '`': // string or identifier
-					_, skip := skipQuoted(query, j)
-					if skip == -1 {
-						return query
-					}
-					j = skip
-				case ';':
-					b.WriteString(";")
-					i += j
-					continue loop
-				}
-			}
-		}
-		b.WriteByte(query[i])
+// isSQLSpace reports whether b is one of the ASCII whitespace bytes matched by
+// the regexp \s class (tab, newline, form feed, carriage return and space).
+func isSQLSpace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\f', '\r':
+		return true
+	default:
+		return false
 	}
-	return b.Bytes()
 }
 
+// matchReturning reports whether s begins with an optional single whitespace
+// byte followed by the case-insensitive keyword "RETURNING". It mirrors the
+// reReturning regexp but allocates nothing per call and works uniformly over
+// both []byte and string inputs, so callers can share a single scan convention.
+func matchReturning[T []byte | string](s T) bool {
+	var i int
+	if len(s) > 0 && isSQLSpace(s[0]) {
+		i = 1
+	}
+	const kw = "RETURNING"
+	if len(s)-i < len(kw) {
+		return false
+	}
+	for k := 0; k < len(kw); k++ {
+		c := s[i+k]
+		if 'a' <= c && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != kw[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// skipQuoted returns the quoted string or identifier that starts at idx (whose
+// byte is the opening quote) together with the index of its closing quote.
+// Backslash-escaped characters are skipped. It returns an index of -1 when the
+// quote is never closed (unexpected end of statement).
 func skipQuoted[T []byte | string](query T, idx int) (T, int) {
 	for j := idx + 1; j < len(query); j++ {
 		switch query[j] {
@@ -321,6 +295,77 @@ func skipQuoted[T []byte | string](query T, idx int) (T, int) {
 	}
 	// Unexpected EOS.
 	return query, -1
+}
+
+// returningClause scans query for the first unquoted RETURNING clause using the
+// shared string/identifier skipping rules. When scanning completes without
+// malformed quoting, ok is true and:
+//
+//   - start is the index where the clause begins (the optional leading space and
+//     the RETURNING keyword), or a negative value when there is no such clause;
+//   - end is the index of the terminating unquoted ';' or len(query) when the
+//     clause runs to the end of the statement.
+//
+// A false ok signals a malformed (unterminated) quote, in which case start/end
+// are unspecified and callers should treat the statement as best-effort.
+func returningClause[T []byte | string](query T) (start, end int, ok bool) {
+	for i := 0; i < len(query); i++ {
+		switch q := query[i]; {
+		case q == '\'', q == '"', q == '`': // string or identifier
+			if _, skip := skipQuoted(query, i); skip != -1 {
+				i = skip
+			} else {
+				return -1, 0, false
+			}
+		case matchReturning(query[i:]):
+			// Forward until the next unquoted ';' appears, or we reach the
+			// end of the statement, honoring the same quote skipping rules.
+			for j := i; j < len(query); j++ {
+				switch query[j] {
+				case '\'', '"', '`': // string or identifier
+					if _, skip := skipQuoted(query, j); skip != -1 {
+						j = skip
+					} else {
+						return -1, 0, false
+					}
+				case ';':
+					return i, j, true
+				}
+			}
+			return i, len(query), true
+		}
+	}
+	return -1, len(query), true
+}
+
+// returningColumns extracts the comma-separated column names from a RETURNING
+// clause as located by returningClause, dropping the leading RETURNING keyword
+// and trimming the whitespace surrounding each name.
+func returningColumns(clause string) []string {
+	cols := strings.Split(reReturning.ReplaceAllString(clause, ""), ",")
+	for i := range cols {
+		cols[i] = strings.TrimSpace(cols[i])
+	}
+	return cols
+}
+
+// trimReturning trims any RETURNING suffix from INSERT/UPDATE queries.
+// Note, that the output may be incorrect or unsafe SQL and require manual changes.
+func trimReturning(query []byte) []byte {
+	start, end, ok := returningClause(query)
+	// Leave the statement untouched on malformed quoting or when there is no
+	// RETURNING clause to trim.
+	if !ok || start < 0 {
+		return query
+	}
+	var b bytes.Buffer
+	b.Grow(len(query))
+	b.Write(query[:start])
+	// Preserve the terminating ';' (and anything following it) when present.
+	if end < len(query) {
+		b.Write(query[end:])
+	}
+	return b.Bytes()
 }
 
 // Tx writes the transaction start.
