@@ -344,6 +344,32 @@ func TestMarshalDefaults(t *testing.T) {
 	require.Equal(t, schema.Fields[8].DefaultKind, reflect.Func)
 }
 
+// TestUnmarshalDefaultsRecovery verifies that UnmarshalSchema correctly
+// recovers numeric default values from JSON (where they arrive as float64)
+// back to their native int/uint types.
+func TestUnmarshalDefaultsRecovery(t *testing.T) {
+	d := WithDefaults{}
+	buf, err := MarshalSchema(d)
+	require.NoError(t, err)
+
+	schema, err := UnmarshalSchema(buf)
+	require.NoError(t, err)
+	require.Equal(t, "WithDefaults", schema.Name)
+
+	// int default: JSON float64 → int64 after UnmarshalSchema defaults().
+	require.Equal(t, int64(1), schema.Fields[0].DefaultValue)
+	// float default stays float64.
+	require.Equal(t, math.Pi, schema.Fields[1].DefaultValue)
+	// string default stays string.
+	require.Equal(t, "foo", schema.Fields[2].DefaultValue)
+	// bool default stays bool.
+	require.Equal(t, true, schema.Fields[3].DefaultValue)
+	// balance is float, stays float64 after recovery.
+	require.Equal(t, float64(0), schema.Fields[6].DefaultValue)
+	// JSON default stays as-is.
+	require.Equal(t, []any{"/tmp"}, schema.Fields[7].DefaultValue)
+}
+
 type TimeMixin struct {
 	mixin.Schema
 }
@@ -403,6 +429,17 @@ func (PrivacyMixin) Policy() ent.Policy {
 	return BoringPolicy{}
 }
 
+// InterceptorMixin provides interceptors to test interceptor position loading.
+type InterceptorMixin struct {
+	mixin.Schema
+}
+
+func (InterceptorMixin) Interceptors() []ent.Interceptor {
+	return []ent.Interceptor{
+		ent.InterceptFunc(func(next ent.Querier) ent.Querier { return next }),
+	}
+}
+
 type WithMixin struct {
 	ent.Schema
 }
@@ -411,6 +448,7 @@ func (WithMixin) Mixin() []ent.Mixin {
 	return []ent.Mixin{
 		TimeMixin{},
 		HooksMixin{},
+		InterceptorMixin{},
 		PrivacyMixin{},
 	}
 }
@@ -438,6 +476,12 @@ func (WithMixin) Indexes() []ent.Index {
 func (WithMixin) Hooks() []ent.Hook {
 	return []ent.Hook{
 		func(ent.Mutator) ent.Mutator { return nil },
+	}
+}
+
+func (WithMixin) Interceptors() []ent.Interceptor {
+	return []ent.Interceptor{
+		ent.InterceptFunc(func(next ent.Querier) ent.Querier { return next }),
 	}
 }
 
@@ -496,6 +540,18 @@ func TestMarshalMixin(t *testing.T) {
 		require.Equal(t, 0, schema.Hooks[2].MixinIndex)
 	})
 
+	t.Run("Interceptors", func(t *testing.T) {
+		require.Len(t, schema.Interceptors, 2)
+		// Mixin interceptor (from InterceptorMixin at index 2).
+		require.True(t, schema.Interceptors[0].MixedIn)
+		require.Equal(t, 2, schema.Interceptors[0].MixinIndex)
+		require.Equal(t, 0, schema.Interceptors[0].Index)
+		// Schema's own interceptor.
+		require.False(t, schema.Interceptors[1].MixedIn)
+		require.Equal(t, 0, schema.Interceptors[1].Index)
+		require.Equal(t, 0, schema.Interceptors[1].MixinIndex)
+	})
+
 	t.Run("Edges", func(t *testing.T) {
 		require.Len(t, schema.Edges, 2)
 		require.Equal(t, "user", schema.Edges[0].Name)
@@ -521,6 +577,162 @@ func TestMarshalMixin(t *testing.T) {
 	t.Run("Policy", func(t *testing.T) {
 		require.Len(t, schema.Policy, 2)
 		require.True(t, schema.Policy[0].MixedIn)
+		require.Equal(t, 3, schema.Policy[0].MixinIndex)
 		require.False(t, schema.Policy[1].MixedIn)
+		require.Equal(t, 0, schema.Policy[1].MixinIndex)
 	})
+}
+
+// --- Panic-protection tests for each safe* wrapper ---
+
+type PanickingFields struct{ ent.Schema }
+
+func (PanickingFields) Fields() []ent.Field { panic("fields boom") }
+
+type PanickingEdges struct{ ent.Schema }
+
+func (PanickingEdges) Edges() []ent.Edge { panic("edges boom") }
+
+type PanickingIndexes struct{ ent.Schema }
+
+func (PanickingIndexes) Indexes() []ent.Index { panic("indexes boom") }
+
+type PanickingHooks struct{ ent.Schema }
+
+func (PanickingHooks) Hooks() []ent.Hook { panic("hooks boom") }
+
+type PanickingInterceptors struct{ ent.Schema }
+
+func (PanickingInterceptors) Interceptors() []ent.Interceptor { panic("interceptors boom") }
+
+type PanickingPolicy struct{ ent.Schema }
+
+func (PanickingPolicy) Policy() ent.Policy { panic("policy boom") }
+
+type PanickingMixin struct{ ent.Schema }
+
+func (PanickingMixin) Mixin() []ent.Mixin { panic("mixin boom") }
+
+// PanickingMixinImpl is a mixin whose Fields panics.
+type PanickingMixinImpl struct{ mixin.Schema }
+
+func (PanickingMixinImpl) Fields() []ent.Field { panic("mixin fields boom") }
+
+type SchemaWithPanickingMixin struct{ ent.Schema }
+
+func (SchemaWithPanickingMixin) Mixin() []ent.Mixin {
+	return []ent.Mixin{PanickingMixinImpl{}}
+}
+
+func TestSafeCallPanics(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema ent.Interface
+		sub    string
+	}{
+		{"Fields", PanickingFields{}, "panics: fields boom"},
+		{"Edges", PanickingEdges{}, "panics: edges boom"},
+		{"Indexes", PanickingIndexes{}, "panics: indexes boom"},
+		{"Hooks", PanickingHooks{}, "panics: hooks boom"},
+		{"Interceptors", PanickingInterceptors{}, "panics: interceptors boom"},
+		{"Policy", PanickingPolicy{}, "panics: policy boom"},
+		{"Mixin", PanickingMixin{}, "panics: mixin boom"},
+		{"MixinFields", SchemaWithPanickingMixin{}, "panics: mixin fields boom"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := MarshalSchema(tt.schema)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.sub)
+		})
+	}
+}
+
+// TestSafeCallZeroValue verifies that safeCall returns the zero value
+// and an error when the wrapped function panics, and the real result
+// when it does not.
+func TestSafeCallZeroValue(t *testing.T) {
+	// Normal call.
+	v, err := safeCall(func() int { return 42 }, "ok")
+	require.NoError(t, err)
+	require.Equal(t, 42, v)
+
+	// Panicking call.
+	v, err = safeCall(func() int { panic("nope") }, "bad")
+	require.Error(t, err)
+	require.Equal(t, 0, v)
+	require.Contains(t, err.Error(), "bad panics: nope")
+
+	// Slice return type.
+	sl, err := safeCall(func() []string { return []string{"a"} }, "slice")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a"}, sl)
+
+	sl, err = safeCall(func() []string { panic("x") }, "slice")
+	require.Error(t, err)
+	require.Nil(t, sl)
+}
+
+// TestNewPosition verifies the position helper.
+func TestNewPosition(t *testing.T) {
+	p := newPosition(3, 0, false)
+	require.Equal(t, 3, p.Index)
+	require.False(t, p.MixedIn)
+	require.Equal(t, 0, p.MixinIndex)
+
+	p = newPosition(1, 2, true)
+	require.Equal(t, 1, p.Index)
+	require.True(t, p.MixedIn)
+	require.Equal(t, 2, p.MixinIndex)
+}
+
+// TestMarshalMixinRoundtrip verifies full marshal → unmarshal roundtrip
+// preserves mixin position metadata.
+func TestMarshalMixinRoundtrip(t *testing.T) {
+	buf, err := MarshalSchema(WithMixin{})
+	require.NoError(t, err)
+
+	schema, err := UnmarshalSchema(buf)
+	require.NoError(t, err)
+
+	// Mixin fields carry position info.
+	require.True(t, schema.Fields[0].Position.MixedIn)
+	require.Equal(t, 0, schema.Fields[0].Position.MixinIndex)
+	// Schema's own field does not.
+	require.Len(t, schema.Fields, 4)
+	require.False(t, schema.Fields[3].Position.MixedIn)
+	require.Equal(t, 0, schema.Fields[3].Position.Index)
+
+	// Hooks: 2 from HooksMixin + 1 from WithMixin.
+	require.Len(t, schema.Hooks, 3)
+	require.True(t, schema.Hooks[0].MixedIn)
+	require.False(t, schema.Hooks[2].MixedIn)
+
+	// Interceptors: 1 from InterceptorMixin + 1 from WithMixin.
+	require.Len(t, schema.Interceptors, 2)
+	require.True(t, schema.Interceptors[0].MixedIn)
+	require.False(t, schema.Interceptors[1].MixedIn)
+
+	// Policy: 1 from PrivacyMixin + 1 from WithMixin.
+	require.Len(t, schema.Policy, 2)
+	require.True(t, schema.Policy[0].MixedIn)
+	require.False(t, schema.Policy[1].MixedIn)
+}
+
+// TestAnnotationMergeWithMixin verifies that schema annotations override
+// (merge with) mixin annotations.
+func TestAnnotationMergeWithMixin(t *testing.T) {
+	buf, err := MarshalSchema(User{})
+	require.NoError(t, err)
+
+	schema, err := UnmarshalSchema(buf)
+	require.NoError(t, err)
+
+	// User's OrderConfig{FieldName: "type annotations"} should override
+	// AnnotationMixin's OrderConfig{FieldName: "mixin annotations"}.
+	ant := schema.Annotations["order_config"].(map[string]any)
+	require.Equal(t, "type annotations", ant["FieldName"])
+
+	// IDConfig from the mixin should still be present.
+	require.Contains(t, schema.Annotations, "id_config")
 }

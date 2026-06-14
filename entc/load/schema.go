@@ -199,30 +199,7 @@ func MarshalSchema(schema ent.Interface) (b []byte, err error) {
 		}
 		s.addAnnotation(at)
 	}
-	if err := s.loadFields(schema); err != nil {
-		return nil, fmt.Errorf("schema %q: %w", s.Name, err)
-	}
-	edges, err := safeEdges(schema)
-	if err != nil {
-		return nil, fmt.Errorf("schema %q: %w", s.Name, err)
-	}
-	for _, e := range edges {
-		s.Edges = append(s.Edges, NewEdge(e.Descriptor()))
-	}
-	indexes, err := safeIndexes(schema)
-	if err != nil {
-		return nil, fmt.Errorf("schema %q: %w", s.Name, err)
-	}
-	for _, idx := range indexes {
-		s.Indexes = append(s.Indexes, NewIndex(idx.Descriptor()))
-	}
-	if err := s.loadHooks(schema); err != nil {
-		return nil, fmt.Errorf("schema %q: %w", s.Name, err)
-	}
-	if err := s.loadInterceptors(schema); err != nil {
-		return nil, fmt.Errorf("schema %q: %w", s.Name, err)
-	}
-	if err := s.loadPolicy(schema); err != nil {
+	if err := s.loadFrom(schema, false, 0); err != nil {
 		return nil, fmt.Errorf("schema %q: %w", s.Name, err)
 	}
 	return json.Marshal(s)
@@ -242,75 +219,28 @@ func UnmarshalSchema(buf []byte) (*Schema, error) {
 	return s, nil
 }
 
-// loadMixin loads mixin to schema from ent.Interface.
+// schemaLike represents the common interface between ent.Interface
+// and ent.Mixin for collecting fields, edges, indexes, hooks,
+// interceptors, and policy.
+type schemaLike interface {
+	Fields() []ent.Field
+	Edges() []ent.Edge
+	Indexes() []ent.Index
+	Hooks() []ent.Hook
+	Interceptors() []ent.Interceptor
+	Policy() ent.Policy
+}
+
+// loadMixin loads all mixins into the schema.
 func (s *Schema) loadMixin(schema ent.Interface) error {
-	mixin, err := safeMixin(schema)
+	mixins, err := safeMixin(schema)
 	if err != nil {
 		return err
 	}
-	for i, mx := range mixin {
-		name := indirect(reflect.TypeOf(mx)).Name()
-		fields, err := safeFields(mx)
-		if err != nil {
+	for i, mx := range mixins {
+		if err := s.loadFrom(mx, true, i); err != nil {
+			name := indirect(reflect.TypeOf(mx)).Name()
 			return fmt.Errorf("mixin %q: %w", name, err)
-		}
-		for j, f := range fields {
-			sf, err := NewField(f.Descriptor())
-			if err != nil {
-				return fmt.Errorf("mixin %q: %w", name, err)
-			}
-			sf.Position = &Position{
-				Index:      j,
-				MixedIn:    true,
-				MixinIndex: i,
-			}
-			s.Fields = append(s.Fields, sf)
-		}
-		edges, err := safeEdges(mx)
-		if err != nil {
-			return fmt.Errorf("mixin %q: %w", name, err)
-		}
-		for _, e := range edges {
-			s.Edges = append(s.Edges, NewEdge(e.Descriptor()))
-		}
-		indexes, err := safeIndexes(mx)
-		if err != nil {
-			return fmt.Errorf("mixin %q: %w", name, err)
-		}
-		for _, idx := range indexes {
-			s.Indexes = append(s.Indexes, NewIndex(idx.Descriptor()))
-		}
-		hooks, err := safeHooks(mx)
-		if err != nil {
-			return fmt.Errorf("mixin %q: %w", name, err)
-		}
-		for j := range hooks {
-			s.Hooks = append(s.Hooks, &Position{
-				Index:      j,
-				MixedIn:    true,
-				MixinIndex: i,
-			})
-		}
-		inters, err := safeInterceptors(mx)
-		if err != nil {
-			return fmt.Errorf("mixin %q: %w", name, err)
-		}
-		for j := range inters {
-			s.Interceptors = append(s.Interceptors, &Position{
-				Index:      j,
-				MixedIn:    true,
-				MixinIndex: i,
-			})
-		}
-		policy, err := safePolicy(mx)
-		if err != nil {
-			return fmt.Errorf("mixin %q: %w", name, err)
-		}
-		if policy != nil {
-			s.Policy = append(s.Policy, &Position{
-				MixedIn:    true,
-				MixinIndex: i,
-			})
 		}
 		for _, at := range mx.Annotations() {
 			s.addAnnotation(at)
@@ -319,60 +249,78 @@ func (s *Schema) loadMixin(schema ent.Interface) error {
 	return nil
 }
 
-// loadFields loads field to schema from ent.Interface.
-func (s *Schema) loadFields(schema ent.Interface) error {
-	fields, err := safeFields(schema)
+// loadFrom collects fields, edges, indexes, hooks, interceptors, and policy
+// from a schema-like source (either an ent.Interface or ent.Mixin) and
+// appends them to the schema with the appropriate position metadata.
+//
+// When mixedIn is true, positions are tagged with the given mixinIdx to
+// indicate they originated from a mixin; when false, they are recorded as
+// belonging to the schema itself.
+func (s *Schema) loadFrom(src schemaLike, mixedIn bool, mixinIdx int) error {
+	// Fields.
+	fields, err := safeFields(src)
 	if err != nil {
 		return err
 	}
-	for i, f := range fields {
+	for j, f := range fields {
 		sf, err := NewField(f.Descriptor())
 		if err != nil {
 			return err
 		}
-		sf.Position = &Position{Index: i}
+		sf.Position = newPosition(j, mixinIdx, mixedIn)
 		s.Fields = append(s.Fields, sf)
 	}
-	return nil
-}
-
-func (s *Schema) loadHooks(schema ent.Interface) error {
-	hooks, err := safeHooks(schema)
+	// Edges.
+	edges, err := safeEdges(src)
 	if err != nil {
 		return err
 	}
-	for i := range hooks {
-		s.Hooks = append(s.Hooks, &Position{
-			Index:   i,
-			MixedIn: false,
-		})
+	for _, e := range edges {
+		s.Edges = append(s.Edges, NewEdge(e.Descriptor()))
 	}
-	return nil
-}
-
-func (s *Schema) loadInterceptors(schema ent.Interface) error {
-	inters, err := safeInterceptors(schema)
+	// Indexes.
+	indexes, err := safeIndexes(src)
 	if err != nil {
 		return err
 	}
-	for i := range inters {
-		s.Interceptors = append(s.Interceptors, &Position{
-			Index:   i,
-			MixedIn: false,
-		})
+	for _, idx := range indexes {
+		s.Indexes = append(s.Indexes, NewIndex(idx.Descriptor()))
 	}
-	return nil
-}
-
-func (s *Schema) loadPolicy(schema ent.Interface) error {
-	policy, err := safePolicy(schema)
+	// Hooks.
+	hooks, err := safeHooks(src)
+	if err != nil {
+		return err
+	}
+	for j := range hooks {
+		s.Hooks = append(s.Hooks, newPosition(j, mixinIdx, mixedIn))
+	}
+	// Interceptors.
+	inters, err := safeInterceptors(src)
+	if err != nil {
+		return err
+	}
+	for j := range inters {
+		s.Interceptors = append(s.Interceptors, newPosition(j, mixinIdx, mixedIn))
+	}
+	// Policy.
+	policy, err := safePolicy(src)
 	if err != nil {
 		return err
 	}
 	if policy != nil {
-		s.Policy = append(s.Policy, &Position{})
+		s.Policy = append(s.Policy, newPosition(0, mixinIdx, mixedIn))
 	}
 	return nil
+}
+
+// newPosition creates a Position for the given index within either a mixin
+// or the schema itself.
+func newPosition(idx, mixinIdx int, mixedIn bool) *Position {
+	return &Position{
+		Index:      idx,
+		MixedIn:    mixedIn,
+		MixinIndex: mixinIdx,
+	}
 }
 
 func (s *Schema) addAnnotation(an schema.Annotation) {
@@ -426,81 +374,51 @@ func (f *Field) defaults() error {
 	return nil
 }
 
-// safeFields wraps the schema.Fields and mixin.Fields method with recover to ensure no panics in marshaling.
-func safeFields(fd interface{ Fields() []ent.Field }) (fields []ent.Field, err error) {
+// safeCall wraps a function call with recover to ensure no panics during
+// schema marshaling. On panic the recovered value is returned as an error
+// labelled with the given name; the zero value of T is returned as the result.
+func safeCall[T any](fn func() T, name string) (result T, err error) {
 	defer func() {
 		if v := recover(); v != nil {
-			err = fmt.Errorf("%T.Fields panics: %v", fd, v)
-			fields = nil
+			err = fmt.Errorf("%s panics: %v", name, v)
 		}
 	}()
-	return fd.Fields(), nil
+	return fn(), nil
 }
 
-// safeEdges wraps the schema.Edges method with recover to ensure no panics in marshaling.
-func safeEdges(schema interface{ Edges() []ent.Edge }) (edges []ent.Edge, err error) {
-	defer func() {
-		if v := recover(); v != nil {
-			err = fmt.Errorf("schema.Edges panics: %v", v)
-			edges = nil
-		}
-	}()
-	return schema.Edges(), nil
+// safeFields wraps the Fields method with recover to ensure no panics in marshaling.
+func safeFields(src interface{ Fields() []ent.Field }) ([]ent.Field, error) {
+	return safeCall(src.Fields, fmt.Sprintf("%T.Fields", src))
 }
 
-// safeIndexes wraps the schema.Indexes method with recover to ensure no panics in marshaling.
-func safeIndexes(schema interface{ Indexes() []ent.Index }) (indexes []ent.Index, err error) {
-	defer func() {
-		if v := recover(); v != nil {
-			err = fmt.Errorf("schema.Indexes panics: %v", v)
-			indexes = nil
-		}
-	}()
-	return schema.Indexes(), nil
+// safeEdges wraps the Edges method with recover to ensure no panics in marshaling.
+func safeEdges(src interface{ Edges() []ent.Edge }) ([]ent.Edge, error) {
+	return safeCall(src.Edges, fmt.Sprintf("%T.Edges", src))
 }
 
-// safeMixin wraps the schema.Mixin method with recover to ensure no panics in marshaling.
-func safeMixin(schema ent.Interface) (mixin []ent.Mixin, err error) {
-	defer func() {
-		if v := recover(); v != nil {
-			err = fmt.Errorf("schema.Mixin panics: %v", v)
-			mixin = nil
-		}
-	}()
-	return schema.Mixin(), nil
+// safeIndexes wraps the Indexes method with recover to ensure no panics in marshaling.
+func safeIndexes(src interface{ Indexes() []ent.Index }) ([]ent.Index, error) {
+	return safeCall(src.Indexes, fmt.Sprintf("%T.Indexes", src))
 }
 
-// safeHooks wraps the schema.Hooks method with recover to ensure no panics in marshaling.
-func safeHooks(schema interface{ Hooks() []ent.Hook }) (hooks []ent.Hook, err error) {
-	defer func() {
-		if v := recover(); v != nil {
-			err = fmt.Errorf("schema.Hooks panics: %v", v)
-			hooks = nil
-		}
-	}()
-	return schema.Hooks(), nil
+// safeMixin wraps the Mixin method with recover to ensure no panics in marshaling.
+func safeMixin(src ent.Interface) ([]ent.Mixin, error) {
+	return safeCall(src.Mixin, fmt.Sprintf("%T.Mixin", src))
 }
 
-// safeInterceptors wraps the schema.Interceptors method with recover to ensure no panics in marshaling.
-func safeInterceptors(schema interface{ Interceptors() []ent.Interceptor }) (inters []ent.Interceptor, err error) {
-	defer func() {
-		if v := recover(); v != nil {
-			err = fmt.Errorf("schema.Interceptors panics: %v", v)
-			inters = nil
-		}
-	}()
-	return schema.Interceptors(), nil
+// safeHooks wraps the Hooks method with recover to ensure no panics in marshaling.
+func safeHooks(src interface{ Hooks() []ent.Hook }) ([]ent.Hook, error) {
+	return safeCall(src.Hooks, fmt.Sprintf("%T.Hooks", src))
 }
 
-// safePolicy wraps the schema.Policy method with recover to ensure no panics in marshaling.
-func safePolicy(schema interface{ Policy() ent.Policy }) (policy ent.Policy, err error) {
-	defer func() {
-		if v := recover(); v != nil {
-			err = fmt.Errorf("schema.Policy panics: %v", v)
-			policy = nil
-		}
-	}()
-	return schema.Policy(), nil
+// safeInterceptors wraps the Interceptors method with recover to ensure no panics in marshaling.
+func safeInterceptors(src interface{ Interceptors() []ent.Interceptor }) ([]ent.Interceptor, error) {
+	return safeCall(src.Interceptors, fmt.Sprintf("%T.Interceptors", src))
+}
+
+// safePolicy wraps the Policy method with recover to ensure no panics in marshaling.
+func safePolicy(src interface{ Policy() ent.Policy }) (ent.Policy, error) {
+	return safeCall(src.Policy, fmt.Sprintf("%T.Policy", src))
 }
 
 func indirect(t reflect.Type) reflect.Type {
