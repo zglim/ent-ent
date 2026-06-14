@@ -62,6 +62,10 @@ type (
 )
 
 // Load loads the schemas package and build the Go plugin with this info.
+//
+// The flow is split into focused stages: load resolves the schema package and
+// discovers its schemas, generate renders the loader program, run executes it,
+// and parseSchemas decodes the result before the source positions are restored.
 func (c *Config) Load() (*SchemaSpec, error) {
 	spec, pos, err := c.load()
 	if err != nil {
@@ -70,39 +74,17 @@ func (c *Config) Load() (*SchemaSpec, error) {
 	if len(c.Names) == 0 {
 		return nil, fmt.Errorf("entc/load: no schema found in: %s", c.Path)
 	}
-	var b bytes.Buffer
-	err = buildTmpl.ExecuteTemplate(&b, "main", struct {
-		*Config
-		Package string
-	}{
-		Config:  c,
-		Package: spec.PkgPath,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("entc/load: execute template: %w", err)
-	}
-	buf, err := format.Source(b.Bytes())
-	if err != nil {
-		return nil, fmt.Errorf("entc/load: format template: %w", err)
-	}
-	if err := os.MkdirAll(".entc", os.ModePerm); err != nil {
-		return nil, err
-	}
-	target := fmt.Sprintf(".entc/%s.go", filename(spec.PkgPath))
-	if err := os.WriteFile(target, buf, 0644); err != nil {
-		return nil, fmt.Errorf("entc/load: write file %s: %w", target, err)
-	}
-	defer os.RemoveAll(".entc")
-	out, err := gorun(target, c.BuildFlags)
+	src, err := c.generate(spec.PkgPath)
 	if err != nil {
 		return nil, err
 	}
-	for _, line := range strings.Split(out, "\n") {
-		schema, err := UnmarshalSchema([]byte(line))
-		if err != nil {
-			return nil, fmt.Errorf("entc/load: unmarshal schema %s: %w", line, err)
-		}
-		spec.Schemas = append(spec.Schemas, schema)
+	out, err := c.run(src, spec.PkgPath)
+	if err != nil {
+		return nil, err
+	}
+	spec.Schemas, err = parseSchemas(out)
+	if err != nil {
+		return nil, err
 	}
 	for _, s := range spec.Schemas {
 		s.Pos = pos[s.Name]
@@ -110,11 +92,78 @@ func (c *Config) Load() (*SchemaSpec, error) {
 	return spec, nil
 }
 
+// generate renders the temporary loader program for the given schema package
+// and returns its gofmt-ed Go source. It is independent of the filesystem and
+// of 'go run', which makes the template output easy to test in isolation.
+func (c *Config) generate(pkgPath string) ([]byte, error) {
+	var b bytes.Buffer
+	err := buildTmpl.ExecuteTemplate(&b, "main", struct {
+		*Config
+		Package string
+	}{
+		Config:  c,
+		Package: pkgPath,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("entc/load: execute template: %w", err)
+	}
+	src, err := format.Source(b.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("entc/load: format template: %w", err)
+	}
+	return src, nil
+}
+
+// run writes the generated program into a temporary ".entc" directory, executes
+// it with 'go run', and returns its raw output. The temporary directory is
+// always removed before returning.
+func (c *Config) run(src []byte, pkgPath string) (string, error) {
+	if err := os.MkdirAll(".entc", os.ModePerm); err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(".entc")
+	target := fmt.Sprintf(".entc/%s.go", filename(pkgPath))
+	if err := os.WriteFile(target, src, 0644); err != nil {
+		return "", fmt.Errorf("entc/load: write file %s: %w", target, err)
+	}
+	return gorun(target, c.BuildFlags)
+}
+
+// parseSchemas decodes the newline-separated schema descriptors printed by the
+// loader program into Schema objects.
+func parseSchemas(out string) ([]*Schema, error) {
+	var schemas []*Schema
+	for _, line := range strings.Split(out, "\n") {
+		schema, err := UnmarshalSchema([]byte(line))
+		if err != nil {
+			return nil, fmt.Errorf("entc/load: unmarshal schema %s: %w", line, err)
+		}
+		schemas = append(schemas, schema)
+	}
+	return schemas, nil
+}
+
 // entInterface holds the reflect.Type of ent.Interface.
 var entInterface = reflect.TypeOf(struct{ ent.Interface }{}).Field(0).Type
 
-// load the ent/schema info.
+// load resolves the schema package and discovers the schema types it declares.
+// It returns the spec together with a name->"file:line" map for the schemas.
 func (c *Config) load() (*SchemaSpec, map[string]string, error) {
+	schemaPkg, entPkg, err := c.loadPackages()
+	if err != nil {
+		return nil, nil, err
+	}
+	names, err := c.schemaNames(schemaPkg, entPkg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &SchemaSpec{PkgPath: schemaPkg.PkgPath, Module: schemaPkg.Module}, names, nil
+}
+
+// loadPackages loads the user schema package along with the ent package that
+// defines ent.Interface, surfaces any package-level errors, and reports which
+// of the two loaded packages is which.
+func (c *Config) loadPackages() (schemaPkg, entPkg *packages.Package, err error) {
 	pkgs, err := packages.Load(&packages.Config{
 		BuildFlags: c.BuildFlags,
 		Mode:       packages.NeedName | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedModule,
@@ -130,31 +179,42 @@ func (c *Config) load() (*SchemaSpec, map[string]string, error) {
 		}
 		return nil, nil, fmt.Errorf("missing package information for: %s", c.Path)
 	}
-	entPkg, pkg := pkgs[0], pkgs[1]
-	if len(pkg.Errors) != 0 {
-		return nil, nil, c.loadError(pkg.Errors[0])
+	// Report errors against the requested order (schema first, ent second)
+	// before resolving identities, so the schema diagnostics (e.g. import
+	// cycles) keep flowing through loadError.
+	entPkg, schemaPkg = pkgs[0], pkgs[1]
+	if len(schemaPkg.Errors) != 0 {
+		return nil, nil, c.loadError(schemaPkg.Errors[0])
 	}
 	if len(entPkg.Errors) != 0 {
 		return nil, nil, entPkg.Errors[0]
 	}
 	if pkgs[0].PkgPath != entInterface.PkgPath() {
-		entPkg, pkg = pkgs[1], pkgs[0]
+		entPkg, schemaPkg = pkgs[1], pkgs[0]
 	}
+	return schemaPkg, entPkg, nil
+}
+
+// schemaNames discovers the exported types declared in schemaPkg that implement
+// ent.Interface, returning a name->"file:line" map. It also resolves c.Names:
+// when empty it is filled with all discovered schemas (sorted), otherwise the
+// caller-provided subset is sorted in place.
+func (c *Config) schemaNames(schemaPkg, entPkg *packages.Package) (map[string]string, error) {
 	names := make(map[string]string)
 	iface := entPkg.Types.Scope().Lookup(entInterface.Name()).Type().Underlying().(*types.Interface)
-	for k, v := range pkg.TypesInfo.Defs {
+	for k, v := range schemaPkg.TypesInfo.Defs {
 		typ, ok := v.(*types.TypeName)
 		if !ok || !k.IsExported() || !types.Implements(typ.Type(), iface) {
 			continue
 		}
 		spec, ok := k.Obj.Decl.(*ast.TypeSpec)
 		if !ok {
-			return nil, nil, fmt.Errorf("invalid declaration %T for %s", k.Obj.Decl, k.Name)
+			return nil, fmt.Errorf("invalid declaration %T for %s", k.Obj.Decl, k.Name)
 		}
 		if _, ok := spec.Type.(*ast.StructType); !ok {
-			return nil, nil, fmt.Errorf("invalid spec type %T for %s", spec.Type, k.Name)
+			return nil, fmt.Errorf("invalid spec type %T for %s", spec.Type, k.Name)
 		}
-		p := pkg.Fset.Position(spec.Pos())
+		p := schemaPkg.Fset.Position(spec.Pos())
 		names[k.Name] = fmt.Sprintf("%s:%d", p.Filename, p.Line)
 	}
 	if len(c.Names) == 0 {
@@ -162,9 +222,12 @@ func (c *Config) load() (*SchemaSpec, map[string]string, error) {
 	} else {
 		sort.Strings(c.Names)
 	}
-	return &SchemaSpec{PkgPath: pkg.PkgPath, Module: pkg.Module}, names, nil
+	return names, nil
 }
 
+// loadError converts a package error into the error returned to the caller.
+// Import-cycle errors are enriched with a hint pointing at the custom types
+// that likely cause the cycle, and the empty "-:" position prefix is stripped.
 func (c *Config) loadError(perr packages.Error) (err error) {
 	if strings.Contains(perr.Msg, "import cycle not allowed") {
 		if cause := c.cycleCause(); cause != "" {
@@ -179,6 +242,9 @@ func (c *Config) loadError(perr packages.Error) (err error) {
 	return err
 }
 
+// cycleCause inspects the schema package source and, when possible, reports the
+// custom (non-schema) types referenced by schema fields that are the likely
+// cause of an import cycle.
 func (c *Config) cycleCause() (cause string) {
 	dir, err := parser.ParseDir(token.NewFileSet(), c.Path, nil, 0)
 	// Ignore reporting in case of parsing
@@ -186,16 +252,37 @@ func (c *Config) cycleCause() (cause string) {
 	if err != nil || len(dir) == 0 {
 		return
 	}
-	// Find the package that contains the schema, or
-	// extract the first package if there is only one.
-	pkg := dir[filepath.Base(c.Path)]
-	if pkg == nil {
-		for _, v := range dir {
-			pkg = v
-			break
-		}
-	}
+	pkg := schemaASTPackage(dir, c.Path)
 	// Package local declarations used by schema fields.
+	locals := localSchemaTypes(pkg)
+	if len(locals) == 0 {
+		return
+	}
+	// Usage of local declarations by schema fields.
+	names := usedLocalTypes(pkg, locals)
+	if len(names) > 0 {
+		cause = fmt.Sprintf("To resolve this issue, move the custom types used by the generated code to a separate package: %s", strings.Join(names, ", "))
+	}
+	return
+}
+
+// schemaASTPackage returns the package that likely holds the schema from a
+// parsed directory: the one matching the directory name, otherwise the first
+// (and, in practice, only) parsed package.
+func schemaASTPackage(dir map[string]*ast.Package, path string) *ast.Package {
+	if pkg := dir[filepath.Base(path)]; pkg != nil {
+		return pkg
+	}
+	for _, pkg := range dir {
+		return pkg
+	}
+	return nil
+}
+
+// localSchemaTypes collects the names of exported, package-local types that are
+// not themselves ent schemas or mixins. These are the custom types that may be
+// referenced by schema fields.
+func localSchemaTypes(pkg *ast.Package) map[string]bool {
 	locals := make(map[string]bool)
 	for _, f := range pkg.Files {
 		for _, d := range f.Decls {
@@ -214,61 +301,65 @@ func (c *Config) cycleCause() (cause string) {
 					locals[ts.Name.Name] = true
 					continue
 				}
-				var embedSchema bool
-				astutil.Apply(st.Fields, func(c *astutil.Cursor) bool {
-					f, ok := c.Node().(*ast.Field)
-					if ok {
-						switch x := f.Type.(type) {
-						case *ast.SelectorExpr:
-							if x.Sel.Name == "Schema" || x.Sel.Name == "Mixin" {
-								embedSchema = true
-							}
-						case *ast.Ident:
-							// A common pattern is to create local base schema to be embedded by other schemas.
-							if name := strings.ToLower(x.Name); name == "schema" || name == "mixin" {
-								embedSchema = true
-							}
-						}
-					}
-					// Stop traversing the AST in case an ~ent.Schema is embedded.
-					return !embedSchema
-				}, nil)
-				if !embedSchema {
+				if !embedsSchema(st) {
 					locals[ts.Name.Name] = true
 				}
 			}
 		}
 	}
-	// No local declarations to report.
-	if len(locals) == 0 {
-		return
-	}
-	// Usage of local declarations by schema fields.
-	goTypes := make(map[string]bool)
+	return locals
+}
+
+// embedsSchema reports whether the struct embeds an ent.Schema or Mixin, either
+// directly or through a local base schema (a common pattern is a local base
+// schema embedded by other schemas).
+func embedsSchema(st *ast.StructType) bool {
+	var embed bool
+	astutil.Apply(st.Fields, func(c *astutil.Cursor) bool {
+		f, ok := c.Node().(*ast.Field)
+		if ok {
+			switch x := f.Type.(type) {
+			case *ast.SelectorExpr:
+				if x.Sel.Name == "Schema" || x.Sel.Name == "Mixin" {
+					embed = true
+				}
+			case *ast.Ident:
+				if name := strings.ToLower(x.Name); name == "schema" || name == "mixin" {
+					embed = true
+				}
+			}
+		}
+		// Stop traversing the AST in case an ~ent.Schema is embedded.
+		return !embed
+	}, nil)
+	return embed
+}
+
+// usedLocalTypes returns the sorted, quoted names of the given local types that
+// are referenced in the bodies of schema "Fields" methods.
+func usedLocalTypes(pkg *ast.Package, locals map[string]bool) []string {
+	used := make(map[string]bool)
 	for _, f := range pkg.Files {
 		for _, d := range f.Decls {
-			f, ok := d.(*ast.FuncDecl)
-			if !ok || f.Name.Name != "Fields" || f.Type.Params.NumFields() != 0 || f.Type.Results.NumFields() != 1 {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Name.Name != "Fields" || fn.Type.Params.NumFields() != 0 || fn.Type.Results.NumFields() != 1 {
 				continue
 			}
-			astutil.Apply(f.Body, func(cursor *astutil.Cursor) bool {
+			astutil.Apply(fn.Body, func(cursor *astutil.Cursor) bool {
 				i, ok := cursor.Node().(*ast.Ident)
 				if ok && locals[i.Name] {
-					goTypes[i.Name] = true
+					used[i.Name] = true
 				}
 				return true
 			}, nil)
 		}
 	}
-	names := make([]string, 0, len(goTypes))
-	for k := range goTypes {
+	names := make([]string, 0, len(used))
+	for k := range used {
 		names = append(names, strconv.Quote(k))
 	}
 	sort.Strings(names)
-	if len(names) > 0 {
-		cause = fmt.Sprintf("To resolve this issue, move the custom types used by the generated code to a separate package: %s", strings.Join(names, ", "))
-	}
-	return
+	return names
 }
 
 var (
@@ -325,7 +416,7 @@ func filename(pkg string) string {
 	return fmt.Sprintf("entc_%s_%d", name, time.Now().Unix())
 }
 
-// run 'go run' command and return its output.
+// gorun runs the 'go run' command on the given target and returns its output.
 func gorun(target string, buildFlags []string) (string, error) {
 	s, err := gocmd("run", target, buildFlags)
 	if err != nil {
@@ -340,7 +431,8 @@ func golist(target string, buildFlags []string) error {
 	return err
 }
 
-// goCmd runs a go command and returns its output.
+// gocmd runs a go command on the given target and returns its standard output.
+// On failure, the trimmed standard error is returned as the error.
 func gocmd(command, target string, buildFlags []string) (string, error) {
 	args := []string{command}
 	args = append(args, buildFlags...)
