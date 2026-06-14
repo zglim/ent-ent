@@ -111,45 +111,7 @@ func (w *WriteDriver) Query(ctx context.Context, query string, args, res any) er
 			return err
 		}
 		if rr, ok := res.(*sql.Rows); ok {
-			cols := func() []string {
-				// If the query has a RETURNING clause, mock the result.
-				var clause string
-			outer:
-				for i := 0; i < len(query); i++ {
-					switch q := query[i]; {
-					case q == '\'', q == '"', q == '`': // string or identifier
-						_, skip := skipQuoted(query, i)
-						if skip == -1 {
-							return nil // malformed SQL
-						}
-						i = skip
-						continue
-					case reReturning.MatchString(query[i:]):
-						var j int
-					inner:
-						// Forward until next unquoted ';' appears, or we reach the end of the query.
-						for j = i; j < len(query); j++ {
-							switch query[j] {
-							case '\'', '"', '`': // string or identifier
-								_, skip := skipQuoted(query, j)
-								if skip == -1 {
-									return nil // malformed RETURNING clause
-								}
-								j = skip
-							case ';':
-								break inner
-							}
-						}
-						clause = query[i:j]
-						break outer
-					}
-				}
-				cols := strings.Split(reReturning.ReplaceAllString(clause, ""), ",")
-				for i := range cols {
-					cols[i] = strings.TrimSpace(cols[i])
-				}
-				return cols
-			}()
+			cols := parseReturningColumns(query)
 			*rr = sql.Rows{ColumnScanner: &noRows{cols: cols}}
 		}
 		return nil
@@ -162,7 +124,7 @@ func (w *WriteDriver) Query(ctx context.Context, query string, args, res any) er
 	}
 }
 
-// expandArgs combines to arguments and statement into a single statement to
+// expandArgs combines the arguments and statement into a single statement to
 // print or write into a file (before editing).
 // Note, the output may be incorrect or unsafe SQL and require manual changes.
 func (w *WriteDriver) expandArgs(query string, args []any) string {
@@ -171,39 +133,30 @@ func (w *WriteDriver) expandArgs(query string, args []any) string {
 		p    = w.placeholder()
 		scan = w.scanPlaceholder()
 	)
-	for i := 0; i < len(query); i++ {
-	Top:
-		switch query[i] {
-		case p:
-			idx, size := scan(query[i+1:])
+	sc := newSQLScanner(query)
+	for sc.next() {
+		switch {
+		case sc.isQuoted():
+			b.WriteString(sc.quoted())
+		case sc.cur() == p:
+			idx, size := scan(query[sc.pos+1:])
 			// Unrecognized placeholder.
 			if idx < 0 || idx >= len(args) {
 				return query
 			}
-			i += size
+			sc.advance(size)
 			v, err := w.formatArg(args[idx])
 			if err != nil {
 				// Unexpected formatting error.
 				return query
 			}
 			b.WriteString(v)
-		// String or identifier.
-		case '\'', '"', '`':
-			for j := i + 1; j < len(query); j++ {
-				switch query[j] {
-				case '\\':
-					j++
-				case query[i]:
-					b.WriteString(query[i : j+1])
-					i = j
-					break Top
-				}
-			}
-			// Unexpected EOS.
-			return query
 		default:
-			b.WriteByte(query[i])
+			b.WriteByte(sc.cur())
 		}
+	}
+	if sc.malformed() {
+		return query
 	}
 	return b.String()
 }
@@ -273,26 +226,128 @@ func (w *WriteDriver) formatArg(v any) (string, error) {
 
 var reReturning = regexp.MustCompile(`(?i)^\s?RETURNING`)
 
+// sqlScanner provides a unified cursor over SQL text that tracks position
+// and handles skipping over quoted strings and identifiers. Both the
+// RETURNING clause parser and the argument expander use this scanner to
+// avoid duplicating the quote-skipping logic.
+type sqlScanner struct {
+	query string
+	pos   int
+	// end of the last quoted region (inclusive). -1 if not in a quoted region.
+	qEnd int
+	err  bool
+}
+
+func newSQLScanner(query string) *sqlScanner {
+	return &sqlScanner{query: query, pos: -1, qEnd: -1}
+}
+
+// next advances the cursor by one byte. Returns false at end of input.
+func (s *sqlScanner) next() bool {
+	s.pos++
+	s.qEnd = -1
+	return s.pos < len(s.query)
+}
+
+// advance skips additional bytes (beyond the current position).
+func (s *sqlScanner) advance(n int) {
+	s.pos += n
+}
+
+// cur returns the byte at the current position.
+func (s *sqlScanner) cur() byte {
+	return s.query[s.pos]
+}
+
+// isQuoted checks if the current position starts a quoted string or identifier.
+// If so, it computes the end of the quoted region and stores it in qEnd.
+func (s *sqlScanner) isQuoted() bool {
+	c := s.query[s.pos]
+	if c != '\'' && c != '"' && c != '`' {
+		return false
+	}
+	_, end := skipQuoted(s.query, s.pos)
+	if end == -1 {
+		s.err = true
+		return false
+	}
+	s.qEnd = end
+	return true
+}
+
+// quoted returns the full quoted string (including delimiters) and advances
+// the cursor to the closing quote. Must be called after isQuoted returns true.
+func (s *sqlScanner) quoted() string {
+	q := s.query[s.pos : s.qEnd+1]
+	s.pos = s.qEnd
+	return q
+}
+
+// malformed reports whether a scanning error (e.g. unterminated quote) occurred.
+func (s *sqlScanner) malformed() bool {
+	return s.err
+}
+
+// findReturningClause locates the RETURNING clause in a SQL query string.
+// It skips quoted strings/identifiers to avoid false matches.
+// Returns the full clause text (e.g. "RETURNING id, name") or "" if not found.
+func findReturningClause(query string) string {
+	sc := newSQLScanner(query)
+	for sc.next() {
+		if sc.isQuoted() {
+			sc.pos = sc.qEnd
+			continue
+		}
+		if reReturning.MatchString(query[sc.pos:]) {
+			// Found RETURNING keyword. Forward until unquoted ';' or end.
+			for j := sc.pos; j < len(query); j++ {
+				switch query[j] {
+				case '\'', '"', '`':
+					_, skip := skipQuoted(query, j)
+					if skip == -1 {
+						return ""
+					}
+					j = skip
+				case ';':
+					return query[sc.pos:j]
+				}
+			}
+			return query[sc.pos:]
+		}
+	}
+	return ""
+}
+
+// parseReturningColumns extracts column names from a RETURNING clause in a SQL
+// query. Returns nil if no RETURNING clause is found or the clause is malformed.
+func parseReturningColumns(query string) []string {
+	clause := findReturningClause(query)
+	if clause == "" {
+		return nil
+	}
+	raw := reReturning.ReplaceAllString(clause, "")
+	cols := strings.Split(raw, ",")
+	for i := range cols {
+		cols[i] = strings.TrimSpace(cols[i])
+	}
+	return cols
+}
+
 // trimReturning trims any RETURNING suffix from INSERT/UPDATE queries.
 // Note, that the output may be incorrect or unsafe SQL and require manual changes.
 func trimReturning(query []byte) []byte {
 	var b bytes.Buffer
+	sc := newSQLScanner(string(query))
 loop:
-	for i := 0; i < len(query); i++ {
-		switch q := query[i]; {
-		case q == '\'', q == '"', q == '`': // string or identifier
-			s, skip := skipQuoted(query, i)
-			if skip == -1 {
-				return query
-			}
-			b.Write(s)
-			i = skip
-			continue
-		case reReturning.Match(query[i:]):
+	for sc.next() {
+		switch {
+		case sc.isQuoted():
+			b.WriteString(sc.quoted())
+		case reReturning.Match([]byte(query[sc.pos:])):
 			// Forward until next unquoted ';' appears.
-			for j := i; j < len(query); j++ { // skip "RETURNING"
+			for j := sc.pos; j < len(query); j++ {
 				switch query[j] {
-				case '\'', '"', '`': // string or identifier
+				case '\'', '"', '`':
 					_, skip := skipQuoted(query, j)
 					if skip == -1 {
 						return query
@@ -300,12 +355,13 @@ loop:
 					j = skip
 				case ';':
 					b.WriteString(";")
-					i += j
+					sc.pos = j
 					continue loop
 				}
 			}
+		default:
+			b.WriteByte(sc.cur())
 		}
-		b.WriteByte(query[i])
 	}
 	return b.Bytes()
 }
