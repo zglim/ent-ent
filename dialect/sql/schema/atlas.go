@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"ariga.io/atlas/sql/migrate"
@@ -1223,4 +1224,67 @@ func removeAttr(attrs []schema.Attr, t reflect.Type) []schema.Attr {
 		}
 	}
 	return f
+}
+
+// atImplicitIndexName reports whether name follows the implicit unique-index
+// naming scheme a dialect uses for a UNIQUE column: it equals base, or it is
+// prefix followed by an integer greater than min. The numbered form covers the
+// variants dialects generate when the unsuffixed name is already taken (e.g.
+// "c_2" for MySQL, "<table>_<column>_key1" for PostgreSQL).
+func atImplicitIndexName(name, base, prefix string, min int64) bool {
+	if name == base {
+		return true
+	}
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	i, err := strconv.ParseInt(strings.TrimPrefix(name, prefix), 10, 64)
+	return err == nil && i > min
+}
+
+// atImplicitUniqueIndex adds the implicit unique index named idxName for column
+// c2 to t2, unless an index matching the dialect's implicit naming scheme was
+// already defined explicitly on t1 (reported by match). In that case the index
+// is added later by atIndexes and must not be duplicated here.
+func atImplicitUniqueIndex(t1 *Table, t2 *schema.Table, c2 *schema.Column, idxName string, match func(*Index) bool) {
+	for _, idx := range t1.Indexes {
+		// Index also defined explicitly, and will be added in atIndexes.
+		if idx.Unique && match(idx) {
+			return
+		}
+	}
+	t2.AddIndexes(schema.NewUniqueIndex(idxName).AddColumns(c2))
+}
+
+// atIndexParts resolves every column of idx1 against t2 and appends a matching
+// IndexPart to idx2. When decorate is non-nil it is invoked for each part,
+// allowing a dialect to attach its own attributes (sub-part length, operator
+// class, ...) without re-implementing the shared column lookup.
+func atIndexParts(idx1 *Index, t2 *schema.Table, idx2 *schema.Index, decorate func(*Column, *schema.IndexPart) error) error {
+	for _, c1 := range idx1.Columns {
+		c2, ok := t2.Column(c1.Name)
+		if !ok {
+			return fmt.Errorf("unexpected index %q column: %q", idx1.Name, c1.Name)
+		}
+		part := &schema.IndexPart{C: c2}
+		if decorate != nil {
+			if err := decorate(c1, part); err != nil {
+				return err
+			}
+		}
+		idx2.AddParts(part)
+	}
+	return nil
+}
+
+// atDefaultIncrementC applies the auto-increment handling shared by dialects
+// that mark the column with an attribute (MySQL, SQLite): when the column
+// already has a default, the table-level auto-increment attribute is dropped;
+// otherwise the column itself is annotated with attr.
+func atDefaultIncrementC(t *schema.Table, c *schema.Column, attr schema.Attr) {
+	if c.Default != nil {
+		t.Attrs = removeAttr(t.Attrs, reflect.TypeOf(attr))
+	} else {
+		c.AddAttrs(attr)
+	}
 }

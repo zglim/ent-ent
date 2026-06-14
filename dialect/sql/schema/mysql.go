@@ -8,8 +8,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"reflect"
-	"strconv"
 	"strings"
 
 	"entgo.io/ent/dialect"
@@ -223,21 +221,13 @@ func (d *MySQL) atUniqueC(t1 *Table, c1 *Column, t2 *schema.Table, c2 *schema.Co
 	// For UNIQUE columns, MySQL create an implicit index
 	// named as the column with an extra index in case the
 	// name is already taken (<e.g. c>, <c_2>, <c_3>, ...).
-	for _, idx := range t1.Indexes {
-		// Index also defined explicitly, and will be add in atIndexes.
-		if idx.Unique && d.atImplicitIndexName(idx, c1) {
-			return
-		}
-	}
-	t2.AddIndexes(schema.NewUniqueIndex(c1.Name).AddColumns(c2))
+	atImplicitUniqueIndex(t1, t2, c2, c1.Name, func(idx *Index) bool {
+		return atImplicitIndexName(idx.Name, c1.Name, c1.Name+"_", 1)
+	})
 }
 
 func (d *MySQL) atIncrementC(t *schema.Table, c *schema.Column) {
-	if c.Default != nil {
-		t.Attrs = removeAttr(t.Attrs, reflect.TypeOf(&mysql.AutoIncrement{}))
-	} else {
-		c.AddAttrs(&mysql.AutoIncrement{})
-	}
+	atDefaultIncrementC(t, c, &mysql.AutoIncrement{})
 }
 
 func (d *MySQL) atIncrementT(t *schema.Table, v int64) {
@@ -246,29 +236,15 @@ func (d *MySQL) atIncrementT(t *schema.Table, v int64) {
 	}
 }
 
-func (d *MySQL) atImplicitIndexName(idx *Index, c1 *Column) bool {
-	if idx.Name == c1.Name {
-		return true
-	}
-	if !strings.HasPrefix(idx.Name, c1.Name+"_") {
-		return false
-	}
-	i, err := strconv.ParseInt(strings.TrimLeft(idx.Name, c1.Name+"_"), 10, 64)
-	return err == nil && i > 1
-}
-
 func (d *MySQL) atIndex(idx1 *Index, t2 *schema.Table, idx2 *schema.Index) error {
 	prefix := indexParts(idx1)
-	for _, c1 := range idx1.Columns {
-		c2, ok := t2.Column(c1.Name)
-		if !ok {
-			return fmt.Errorf("unexpected index %q column: %q", idx1.Name, c1.Name)
-		}
-		part := &schema.IndexPart{C: c2}
+	if err := atIndexParts(idx1, t2, idx2, func(c1 *Column, part *schema.IndexPart) error {
 		if v, ok := prefix[c1.Name]; ok {
 			part.AddAttrs(&mysql.SubPart{Len: int(v)})
 		}
-		idx2.AddParts(part)
+		return nil
+	}); err != nil {
+		return err
 	}
 	if t, ok := indexType(idx1, dialect.MySQL); ok {
 		idx2.AddAttrs(&mysql.IndexType{T: t})

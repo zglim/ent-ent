@@ -8,8 +8,6 @@ import (
 	"context"
 	stdsql "database/sql"
 	"fmt"
-	"reflect"
-	"strconv"
 	"strings"
 
 	"entgo.io/ent/dialect"
@@ -150,33 +148,13 @@ func (d *SQLite) atUniqueC(t1 *Table, c1 *Column, t2 *schema.Table, c2 *schema.C
 	// For UNIQUE columns, SQLite create an implicit index named
 	// "sqlite_autoindex_<table>_<i>". Ent uses the PostgreSQL approach
 	// in its migration, and name these indexes as "<table>_<column>_key".
-	for _, idx := range t1.Indexes {
-		// Index also defined explicitly, and will be add in atIndexes.
-		if idx.Unique && d.atImplicitIndexName(idx, t1, c1) {
-			return
-		}
-	}
-	t2.AddIndexes(schema.NewUniqueIndex(fmt.Sprintf("%s_%s_key", t2.Name, c1.Name)).AddColumns(c2))
-}
-
-func (d *SQLite) atImplicitIndexName(idx *Index, t1 *Table, c1 *Column) bool {
-	if idx.Name == c1.Name {
-		return true
-	}
-	p := fmt.Sprintf("sqlite_autoindex_%s_", t1.Name)
-	if !strings.HasPrefix(idx.Name, p) {
-		return false
-	}
-	i, err := strconv.ParseInt(strings.TrimPrefix(idx.Name, p), 10, 64)
-	return err == nil && i > 0
+	atImplicitUniqueIndex(t1, t2, c2, fmt.Sprintf("%s_%s_key", t2.Name, c1.Name), func(idx *Index) bool {
+		return atImplicitIndexName(idx.Name, c1.Name, fmt.Sprintf("sqlite_autoindex_%s_", t1.Name), 0)
+	})
 }
 
 func (d *SQLite) atIncrementC(t *schema.Table, c *schema.Column) {
-	if c.Default != nil {
-		t.Attrs = removeAttr(t.Attrs, reflect.TypeOf(&sqlite.AutoIncrement{}))
-	} else {
-		c.AddAttrs(&sqlite.AutoIncrement{})
-	}
+	atDefaultIncrementC(t, c, &sqlite.AutoIncrement{})
 }
 
 func (d *SQLite) atIncrementT(t *schema.Table, v int64) {
@@ -184,12 +162,8 @@ func (d *SQLite) atIncrementT(t *schema.Table, v int64) {
 }
 
 func (d *SQLite) atIndex(idx1 *Index, t2 *schema.Table, idx2 *schema.Index) error {
-	for _, c1 := range idx1.Columns {
-		c2, ok := t2.Column(c1.Name)
-		if !ok {
-			return fmt.Errorf("unexpected index %q column: %q", idx1.Name, c1.Name)
-		}
-		idx2.AddParts(&schema.IndexPart{C: c2})
+	if err := atIndexParts(idx1, t2, idx2, nil); err != nil {
+		return err
 	}
 	if idx1.Annotation != nil && idx1.Annotation.Where != "" {
 		idx2.AddAttrs(&sqlite.IndexPredicate{P: idx1.Annotation.Where})
